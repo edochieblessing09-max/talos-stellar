@@ -35,6 +35,7 @@
 //! | `Claimed(epoch_id, patron)` | `bool`           | persistent  |
 //! | `RoundingDust(talos_id, epoch_id)` | `i128`     | persistent  |
 //! | `NextEpochId(talos_id)`     | `u64`            | persistent  |
+//! | `PendingAdmin`              | `Address`        | persistent  |
 //!
 //! ## Events (topics → data)
 //!
@@ -44,6 +45,9 @@
 //! | `div_clm`  | `(symbol, epoch_id: u64, patron: Address)`| `(talos_id: u32, amount: i128, role: PatronRole)`  |
 //! | `div_dst`  | `(symbol, epoch_id: u64)`                  | `(talos_id: u32, dust: i128)`                      |
 //! | `ep_rcv`   | `(symbol, epoch_id: u64)`                 | `(talos_id: u32, recovered: i128, admin: Address)` |
+//! | `adm_prp`  | `(symbol,)`                               | `(current: Address, proposed: Address)`            |
+//! | `adm_acc`  | `(symbol,)`                               | `(new_admin: Address,)`                            |
+//! | `adm_cnl`  | `(symbol,)`                               | `(cancelled: Address,)`                            |
 //!
 //! ## Compatibility / rollout notes
 //!
@@ -109,6 +113,10 @@ pub enum ContractError {
     AlreadyRecovered = 15,
     /// Supplied patron shares do not sum to 100%.
     InvalidPatronShares = 16,
+    /// Rounding dust calculation conflicts with existing epoch claim data.
+    InconsistentShareData = 17,
+    /// No pending administrator nomination exists to accept or cancel.
+    NoPendingAdmin = 18,
 }
 
 // ── Data types ───────────────────────────────────────────────────────────────
@@ -180,6 +188,8 @@ pub enum DataKey {
     /// Rounding remainder derived from the epoch's validated patron split.
     /// Appended to preserve existing key discriminants.
     RoundingDust(u32, u64),
+    /// Nominated administrator awaiting acceptance: `PendingAdmin`.
+    PendingAdmin,
 }
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -236,6 +246,21 @@ fn emit_epoch_recovered(env: &Env, epoch_id: u64, talos_id: u32, recovered: i128
         (symbol_short!("ep_rcv"), epoch_id),
         (talos_id, recovered, admin),
     );
+}
+
+fn emit_admin_proposed(env: &Env, current: Address, proposed: Address) {
+    let topics = (symbol_short!("adm_prp"),);
+    env.events().publish(topics, (current, proposed));
+}
+
+fn emit_admin_accepted(env: &Env, new_admin: Address) {
+    let topics = (symbol_short!("adm_acc"),);
+    env.events().publish(topics, (new_admin,));
+}
+
+fn emit_admin_cancelled(env: &Env, cancelled: Address) {
+    let topics = (symbol_short!("adm_cnl"),);
+    env.events().publish(topics, (cancelled,));
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -514,7 +539,7 @@ impl TalosDividends {
             treasury_share,
         )?;
         let dust_key = DataKey::RoundingDust(talos_id, epoch_id);
-        if let Some(recorded_dust) = env.storage().persistent().get(&dust_key) {
+        if let Some(recorded_dust) = env.storage().persistent().get::<DataKey, i128>(&dust_key) {
             if recorded_dust != dust {
                 return Err(ContractError::InconsistentShareData);
             }
@@ -653,6 +678,96 @@ impl TalosDividends {
     pub fn version(_env: Env) -> (u32, u32, u32) {
         CONTRACT_VERSION
     }
+
+    // ── Two-step admin transfer ──────────────────────────────────────
+
+    /// Nominate `new_admin` as the next administrator.
+    ///
+    /// The transfer is not immediate. The nominated address must call
+    /// `accept_admin` to confirm and complete the handover. Until then the
+    /// current admin retains all privileges.
+    ///
+    /// Calling `propose_admin` while a transfer is already pending replaces
+    /// the old nomination with the new one.
+    ///
+    /// # Authorization
+    /// Requires the current admin to sign the transaction.
+    ///
+    /// # Panics / Errors
+    /// - [`ContractError::NotInitialized`] — if `initialize` has not been called.
+    /// - [`ContractError::Unauthorized`] — caller is not the configured administrator.
+    pub fn propose_admin(env: Env, new_admin: Address) -> Result<(), ContractError> {
+        let current: Address = require_admin_addr(&env)?;
+        current.require_auth();
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::PendingAdmin, &new_admin);
+
+        emit_admin_proposed(&env, current, new_admin);
+        Ok(())
+    }
+
+    /// Complete the pending admin transfer.
+    ///
+    /// The nominated address (stored under `PendingAdmin`) must call this
+    /// method and authorize it. On success:
+    ///   1. `Admin` is updated to the caller's address.
+    ///   2. The `PendingAdmin` storage entry is removed.
+    ///   3. An `adm_acc` event is emitted.
+    ///
+    /// # Authorization
+    /// Requires the pending admin to sign the transaction.
+    ///
+    /// # Panics / Errors
+    /// - [`ContractError::NoPendingAdmin`] — if `propose_admin` has not been called.
+    pub fn accept_admin(env: Env) -> Result<(), ContractError> {
+        let pending: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingAdmin)
+            .ok_or(ContractError::NoPendingAdmin)?;
+
+        pending.require_auth();
+
+        env.storage().persistent().set(&DataKey::Admin, &pending);
+        env.storage().persistent().remove(&DataKey::PendingAdmin);
+
+        emit_admin_accepted(&env, pending);
+        Ok(())
+    }
+
+    /// Cancel an in-progress admin transfer.
+    ///
+    /// Removes the `PendingAdmin` entry and revokes the nomination without
+    /// changing the current admin.
+    ///
+    /// # Authorization
+    /// Requires the current admin to sign the transaction.
+    ///
+    /// # Panics / Errors
+    /// - [`ContractError::NotInitialized`] — if `initialize` has not been called.
+    /// - [`ContractError::NoPendingAdmin`] — if there is nothing to cancel.
+    pub fn cancel_admin_transfer(env: Env) -> Result<(), ContractError> {
+        let current: Address = require_admin_addr(&env)?;
+        current.require_auth();
+
+        let pending: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingAdmin)
+            .ok_or(ContractError::NoPendingAdmin)?;
+
+        env.storage().persistent().remove(&DataKey::PendingAdmin);
+
+        emit_admin_cancelled(&env, pending);
+        Ok(())
+    }
+
+    /// Return the pending admin address, if any.
+    pub fn pending_admin(env: Env) -> Option<Address> {
+        env.storage().persistent().get(&DataKey::PendingAdmin)
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -720,7 +835,6 @@ mod tests {
                 },
             }])
             .commit_epoch(admin, &talos_id, &total_amount, &expiry_secs)
-            .unwrap()
     }
 
     /// Helper: commit a default epoch (total=10_000, expiry=7_200s).
@@ -744,9 +858,25 @@ mod tests {
             .commit_epoch(admin, &talos_id, &10_000_i128, &7_200_u64)
     }
 
+    /// Helper: perform a claim with provided patron addresses and default 60/25/15 shares.
+    fn do_claim(
+        env: &Env,
+        contract_id: &Address,
+        client: &TalosDividendsClient<'static>,
+        claimant: &Address,
+        talos_id: u32,
+        epoch_id: u64,
+        creator: &Address,
+        investor: &Address,
+        treasury: &Address,
+    ) -> i128 {
+        do_claim_with_shares(
+            env, contract_id, client, claimant, talos_id, epoch_id, creator, investor, treasury,
+            60, 25, 15,
+        )
+    }
+
     /// Helper: perform a claim with provided patron addresses and shares.
-    /// Returns the allocation on success; panics if the contract returns an error.
-    /// For negative-path tests, call `try_claim_dividend` directly.
     #[allow(clippy::too_many_arguments)]
     fn do_claim_with_shares(
         env: &Env,
@@ -758,6 +888,9 @@ mod tests {
         creator: &Address,
         investor: &Address,
         treasury: &Address,
+        creator_share: u32,
+        investor_share: u32,
+        treasury_share: u32,
     ) -> i128 {
         client
             .mock_auths(&[MockAuth {
@@ -781,17 +914,20 @@ mod tests {
                 },
             }])
             .claim_dividend(
-                claimant, &talos_id, &epoch_id, creator, investor, treasury, &creator_share,
-                &investor_share, &treasury_share,
+                claimant,
+                &talos_id,
+                &epoch_id,
+                creator,
+                investor,
+                treasury,
+                &creator_share,
+                &investor_share,
+                &treasury_share,
             )
     }
 
-    /// Like `do_claim` but uses `try_claim_dividend` to surface errors.
-    /// Returns the raw soroban-sdk 21 result: `Ok(Ok(allocation))` on success,
-    /// `Ok(Err(_))` when the contract returns an error, `Err(_)` on host error.
-    /// Assertions should use the `Err(Ok(ContractError::...))` pattern.
     #[allow(clippy::too_many_arguments)]
-    fn try_do_claim(
+    fn try_do_claim_with_shares(
         env: &Env,
         contract_id: &Address,
         client: &TalosDividendsClient<'static>,
@@ -801,8 +937,10 @@ mod tests {
         creator: &Address,
         investor: &Address,
         treasury: &Address,
-    ) -> Result<Result<i128, soroban_sdk::Error>, Result<ContractError, soroban_sdk::InvokeError>>
-    {
+        creator_share: u32,
+        investor_share: u32,
+        treasury_share: u32,
+    ) -> Result<Result<i128, soroban_sdk::Error>, Result<ContractError, soroban_sdk::InvokeError>> {
         client
             .mock_auths(&[MockAuth {
                 address: claimant,
@@ -816,18 +954,54 @@ mod tests {
                         creator.clone(),
                         investor.clone(),
                         treasury.clone(),
-                        60_u32,
-                        25_u32,
-                        15_u32,
+                        creator_share,
+                        investor_share,
+                        treasury_share,
                     )
                         .into_val(env),
                     sub_invokes: &[],
                 },
             }])
             .try_claim_dividend(
-                claimant, &talos_id, &epoch_id, creator, investor, treasury, &60_u32, &25_u32,
-                &15_u32,
+                claimant,
+                &talos_id,
+                &epoch_id,
+                creator,
+                investor,
+                treasury,
+                &creator_share,
+                &investor_share,
+                &treasury_share,
             )
+    }
+
+    /// Like `do_claim` but uses `try_claim_dividend` to surface errors.
+    #[allow(clippy::too_many_arguments)]
+    fn try_do_claim(
+        env: &Env,
+        contract_id: &Address,
+        client: &TalosDividendsClient<'static>,
+        claimant: &Address,
+        talos_id: u32,
+        epoch_id: u64,
+        creator: &Address,
+        investor: &Address,
+        treasury: &Address,
+    ) -> Result<Result<i128, soroban_sdk::Error>, Result<ContractError, soroban_sdk::InvokeError>> {
+        try_do_claim_with_shares(
+            env,
+            contract_id,
+            client,
+            claimant,
+            talos_id,
+            epoch_id,
+            creator,
+            investor,
+            treasury,
+            60_u32,
+            25_u32,
+            15_u32,
+        )
     }
 
     // ── version() ────────────────────────────────────────────────────────────
@@ -1086,8 +1260,7 @@ mod tests {
         do_claim_with_shares(
             &env, &contract_id, &client, &creator, talos_id, epoch_id, &creator, &investor,
             &treasury, 60, 25, 15,
-        )
-        .unwrap();
+        );
 
         assert_eq!(client.get_rounding_dust(&talos_id, &epoch_id), Some(1));
         let events = env.events().all();
@@ -1114,13 +1287,12 @@ mod tests {
         let treasury = Address::generate(&env);
         let epoch_id = commit_epoch(&env, &contract_id, &client, &admin, talos_id, 101, 7_200);
 
-        do_claim(&env, &contract_id, &client, &creator, talos_id, epoch_id, &creator, &investor, &treasury)
-            .unwrap();
-        let result = do_claim_with_shares(
+        do_claim(&env, &contract_id, &client, &creator, talos_id, epoch_id, &creator, &investor, &treasury);
+        let result = try_do_claim_with_shares(
             &env, &contract_id, &client, &investor, talos_id, epoch_id, &creator, &investor,
             &treasury, 61, 24, 15,
         );
-        assert_eq!(result, Err(ContractError::InconsistentShareData));
+        assert_eq!(result, Err(Ok(ContractError::InconsistentShareData)));
         assert!(!client.has_claimed(&epoch_id, &investor));
     }
 
@@ -1133,8 +1305,7 @@ mod tests {
         let treasury = Address::generate(&env);
         let epoch_id = commit_epoch(&env, &contract_id, &client, &admin, talos_id, 101, 7_200);
 
-        do_claim(&env, &contract_id, &client, &creator, talos_id, epoch_id, &creator, &investor, &treasury)
-            .unwrap();
+        do_claim(&env, &contract_id, &client, &creator, talos_id, epoch_id, &creator, &investor, &treasury);
         env.ledger().with_mut(|li| li.timestamp = 9_000);
 
         let recovered = client
@@ -1147,8 +1318,7 @@ mod tests {
                     sub_invokes: &[],
                 },
             }])
-            .recover_expired(&admin, &talos_id, &epoch_id)
-            .unwrap();
+            .recover_expired(&admin, &talos_id, &epoch_id);
 
         assert_eq!(recovered, 41); // 101 - floor(101 * 60 / 100)
     }
@@ -2708,5 +2878,374 @@ mod tests {
             mem,
             BUDGET_MEM_COMMIT_EPOCH,
         );
+    }
+
+    // ── Admin rotation tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn admin_rotation_happy_path() {
+        let (env, contract_id, admin, _registry, client) = setup();
+        let new_admin = Address::generate(&env);
+
+        // Initially no pending admin, and admin is current
+        assert_eq!(client.pending_admin(), None);
+        assert_eq!(client.get_admin(), Some(admin.clone()));
+
+        // Propose new admin
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "propose_admin",
+                    args: (new_admin.clone(),).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .propose_admin(&new_admin);
+
+        // Check pending admin is set, current admin unchanged
+        assert_eq!(client.pending_admin(), Some(new_admin.clone()));
+        assert_eq!(client.get_admin(), Some(admin.clone()));
+
+        // Verify adm_prp event
+        let events = env.events().all();
+        let (_, topics, data) = events.get(events.len() - 1).unwrap();
+        let sym: Symbol = TryFromVal::try_from_val(&env, &topics.get(0).unwrap()).unwrap();
+        assert_eq!(sym, symbol_short!("adm_prp"));
+        let (ev_curr, ev_prop): (Address, Address) =
+            TryFromVal::try_from_val(&env, &data).unwrap();
+        assert_eq!(ev_curr, admin);
+        assert_eq!(ev_prop, new_admin);
+
+        // Accept admin by nominated new_admin
+        client
+            .mock_auths(&[MockAuth {
+                address: &new_admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "accept_admin",
+                    args: ().into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .accept_admin();
+
+        // Admin is updated and pending cleared
+        assert_eq!(client.get_admin(), Some(new_admin.clone()));
+        assert_eq!(client.pending_admin(), None);
+
+        // Verify adm_acc event
+        let events2 = env.events().all();
+        let (_, topics2, data2) = events2.get(events2.len() - 1).unwrap();
+        let sym2: Symbol = TryFromVal::try_from_val(&env, &topics2.get(0).unwrap()).unwrap();
+        assert_eq!(sym2, symbol_short!("adm_acc"));
+        let (ev_acc,): (Address,) = TryFromVal::try_from_val(&env, &data2).unwrap();
+        assert_eq!(ev_acc, new_admin);
+
+        // Old admin loses rights: cannot commit an epoch
+        let res_old = client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "commit_epoch",
+                    args: (admin.clone(), 1u32, 10_000_i128, 7_200_u64).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_commit_epoch(&admin, &1u32, &10_000_i128, &7_200_u64);
+        assert_eq!(res_old, Err(Ok(ContractError::Unauthorized)));
+
+        // New admin has privileges: can commit an epoch
+        let epoch_id = client
+            .mock_auths(&[MockAuth {
+                address: &new_admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "commit_epoch",
+                    args: (new_admin.clone(), 1u32, 10_000_i128, 7_200_u64).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .commit_epoch(&new_admin, &1u32, &10_000_i128, &7_200_u64);
+        assert_eq!(epoch_id, 1);
+    }
+
+    #[test]
+    fn admin_rotation_wrong_signer() {
+        let (env, contract_id, admin, _registry, client) = setup();
+        let impostor = Address::generate(&env);
+        let new_admin = Address::generate(&env);
+
+        // Impostor cannot propose
+        let res_prop = client
+            .mock_auths(&[MockAuth {
+                address: &impostor,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "propose_admin",
+                    args: (new_admin.clone(),).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_propose_admin(&new_admin);
+        assert_eq!(res_prop, Err(Ok(ContractError::Unauthorized)));
+
+        // Admin proposes properly
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "propose_admin",
+                    args: (new_admin.clone(),).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .propose_admin(&new_admin);
+
+        // Impostor cannot accept
+        let res_acc = client
+            .mock_auths(&[MockAuth {
+                address: &impostor,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "accept_admin",
+                    args: ().into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_accept_admin();
+        assert!(res_acc.is_err());
+
+        // Impostor cannot cancel
+        let res_cnl_imp = client
+            .mock_auths(&[MockAuth {
+                address: &impostor,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "cancel_admin_transfer",
+                    args: ().into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_cancel_admin_transfer();
+        assert_eq!(res_cnl_imp, Err(Ok(ContractError::Unauthorized)));
+
+        // Pending admin cannot cancel (only current admin can cancel)
+        let res_cnl_pending = client
+            .mock_auths(&[MockAuth {
+                address: &new_admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "cancel_admin_transfer",
+                    args: ().into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_cancel_admin_transfer();
+        assert_eq!(res_cnl_pending, Err(Ok(ContractError::Unauthorized)));
+    }
+
+    #[test]
+    fn admin_rotation_cancel() {
+        let (env, contract_id, admin, _registry, client) = setup();
+        let new_admin = Address::generate(&env);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "propose_admin",
+                    args: (new_admin.clone(),).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .propose_admin(&new_admin);
+
+        assert_eq!(client.pending_admin(), Some(new_admin.clone()));
+
+        // Admin cancels transfer
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "cancel_admin_transfer",
+                    args: ().into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .cancel_admin_transfer();
+
+        assert_eq!(client.pending_admin(), None);
+        assert_eq!(client.get_admin(), Some(admin.clone()));
+
+        // Verify adm_cnl event
+        let events = env.events().all();
+        let (_, topics, data) = events.get(events.len() - 1).unwrap();
+        let sym: Symbol = TryFromVal::try_from_val(&env, &topics.get(0).unwrap()).unwrap();
+        assert_eq!(sym, symbol_short!("adm_cnl"));
+        let (ev_cnl,): (Address,) = TryFromVal::try_from_val(&env, &data).unwrap();
+        assert_eq!(ev_cnl, new_admin);
+
+        // Nominated address can no longer accept
+        let res_acc = client
+            .mock_auths(&[MockAuth {
+                address: &new_admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "accept_admin",
+                    args: ().into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_accept_admin();
+        assert_eq!(res_acc, Err(Ok(ContractError::NoPendingAdmin)));
+    }
+
+    #[test]
+    fn admin_rotation_accept_without_pending_admin() {
+        let (env, contract_id, admin, _registry, client) = setup();
+        let any_addr = Address::generate(&env);
+
+        let res = client
+            .mock_auths(&[MockAuth {
+                address: &any_addr,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "accept_admin",
+                    args: ().into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_accept_admin();
+        assert_eq!(res, Err(Ok(ContractError::NoPendingAdmin)));
+
+        // Also test cancel without pending admin
+        let res_cnl = client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "cancel_admin_transfer",
+                    args: ().into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_cancel_admin_transfer();
+        assert_eq!(res_cnl, Err(Ok(ContractError::NoPendingAdmin)));
+    }
+
+    #[test]
+    fn admin_rotation_propose_replaces_existing_pending() {
+        let (env, contract_id, admin, _registry, client) = setup();
+        let nominee1 = Address::generate(&env);
+        let nominee2 = Address::generate(&env);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "propose_admin",
+                    args: (nominee1.clone(),).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .propose_admin(&nominee1);
+        assert_eq!(client.pending_admin(), Some(nominee1.clone()));
+
+        // Propose nominee2 replaces nominee1
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "propose_admin",
+                    args: (nominee2.clone(),).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .propose_admin(&nominee2);
+        assert_eq!(client.pending_admin(), Some(nominee2.clone()));
+
+        // nominee1 cannot accept anymore
+        let res1 = client
+            .mock_auths(&[MockAuth {
+                address: &nominee1,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "accept_admin",
+                    args: ().into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_accept_admin();
+        assert!(res1.is_err());
+
+        // nominee2 accepts
+        client
+            .mock_auths(&[MockAuth {
+                address: &nominee2,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "accept_admin",
+                    args: ().into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .accept_admin();
+        assert_eq!(client.get_admin(), Some(nominee2.clone()));
+        assert_eq!(client.pending_admin(), None);
+    }
+
+    #[test]
+    fn admin_rotation_uninitialized_rejected() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, TalosDividends);
+        let client = TalosDividendsClient::new(&env, &contract_id);
+        let any_addr = Address::generate(&env);
+
+        let res_prop = client
+            .mock_auths(&[MockAuth {
+                address: &any_addr,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "propose_admin",
+                    args: (any_addr.clone(),).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_propose_admin(&any_addr);
+        assert_eq!(res_prop, Err(Ok(ContractError::NotInitialized)));
+
+        let res_acc = client
+            .mock_auths(&[MockAuth {
+                address: &any_addr,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "accept_admin",
+                    args: ().into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_accept_admin();
+        assert_eq!(res_acc, Err(Ok(ContractError::NoPendingAdmin)));
+
+        let res_cnl = client
+            .mock_auths(&[MockAuth {
+                address: &any_addr,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "cancel_admin_transfer",
+                    args: ().into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_cancel_admin_transfer();
+        assert_eq!(res_cnl, Err(Ok(ContractError::NotInitialized)));
     }
 }
