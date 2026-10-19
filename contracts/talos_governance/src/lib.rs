@@ -13,7 +13,7 @@
 extern crate std;
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, String, Symbol, Vec,
+    contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, IntoVal, String, Symbol, Vec,
 };
 use ttl_manager;
 use pause_control;
@@ -91,6 +91,8 @@ pub enum DataKey {
     /// threshold.  Presence (value `true`) prevents re-emitting
     /// `EventQuorumReached` for subsequent votes.
     QuorumReached(u32),
+    /// Configured TalosRegistry contract address.
+    RegistryContract,
 }
 
 #[contracttype]
@@ -319,6 +321,11 @@ fn emit_quorum_reached(
         .publish((symbol_short!("qrm_rchd"), proposal_id), payload);
 }
 
+fn emit_registry_updated(env: &Env, old_registry: Option<Address>, new_registry: Address) {
+    let topics = (symbol_short!("reg_upd"),);
+    env.events().publish(topics, (old_registry, new_registry));
+}
+
 // ── Stable interface (v1.1.0) ───────────────────────────────────────
 //
 // v1.1.0 adds:
@@ -370,6 +377,69 @@ pub fn version_supports(actual: (u32, u32, u32), required: (u32, u32, u32)) -> b
         return false;
     }
     actual.2 >= required.2
+}
+
+/// Expected `INTERFACE_ID` of the configured `RegistryContract`, mirroring
+/// the bytes published by `talos_registry::INTERFACE_ID` (namespace
+/// `"TalosRegistry"`, version `(1, 4, 0)`). Kept as an inline copy rather
+/// than a crate dependency so this contract's ABI check has no build-time
+/// coupling to the Registry crate.
+pub const EXPECTED_REGISTRY_INTERFACE_ID: [u8; 32] = [
+    0x54, 0x61, 0x6C, 0x6F, 0x73, 0x52, 0x65, 0x67, // "TalosReg"
+    0x69, 0x73, 0x74, 0x72, 0x79, 0x00, 0x00, 0x00, // "istry" + zero pads
+    // (major, minor, patch) big-endian u32s
+    0x00, 0x00, 0x00, 0x01, // major = 1
+    0x00, 0x00, 0x00, 0x04, // minor = 4
+    0x00, 0x00, 0x00, 0x00, // patch = 0
+    // reserved
+    0x00, 0x00, 0x00, 0x00,
+];
+
+/// Cross-contract compatibility helper.
+///
+/// Verifies that a contract registered as a `TalosRegistry` actually
+/// publishes the expected `INTERFACE_ID`. Emits a `compat_ok` event
+/// when the check passes and a `compat_err` event when it fails.
+pub fn check_registry_compatible(
+    e: &Env,
+    registry: &Address,
+    revert_on_mismatch: bool,
+) -> bool {
+    let registry_id: BytesN<32> = e.invoke_contract(
+        registry,
+        &Symbol::new(e, "interface_id"),
+        soroban_sdk::vec![e],
+    );
+
+    if registry_id != BytesN::from_array(e, &EXPECTED_REGISTRY_INTERFACE_ID) {
+        let topics = (Symbol::new(e, "compat_err"),);
+        e.events().publish(topics, ());
+        if revert_on_mismatch {
+            panic!("Registry interface ID mismatch: expected TalosRegistry-compatible v1");
+        }
+        return false;
+    }
+
+    let version: (u32, u32, u32) = e.invoke_contract(
+        registry,
+        &Symbol::new(e, "version"),
+        soroban_sdk::vec![e],
+    );
+
+    if !version_supports(version, (1, 1, 0)) {
+        let topics = (Symbol::new(e, "compat_err"),);
+        e.events()
+            .publish(topics, (version.0, version.1, version.2));
+        if revert_on_mismatch {
+            panic!("Registry version too old: requires TalosRegistry >= 1.1.0");
+        }
+        return false;
+    }
+
+    let topics = (symbol_short!("compat_ok"),);
+    e.events()
+        .publish(topics, (version.0, version.1, version.2));
+    true
 }
 
 #[contract]
@@ -433,6 +503,24 @@ impl TalosGovernance {
         }
         if description.len() == 0 {
             panic!("Description cannot be empty");
+        }
+
+        // Validate talos_id if a registry contract is configured.
+        // For registry-unset deployments, the check is explicitly skipped to preserve
+        // backwards compatibility with unconfigured or legacy deployments.
+        if let Some(registry) = env
+            .storage()
+            .persistent()
+            .get::<_, Address>(&DataKey::RegistryContract)
+        {
+            let is_active: bool = env.invoke_contract(
+                &registry,
+                &Symbol::new(&env, "is_active"),
+                soroban_sdk::vec![&env, talos_id.into_val(&env)],
+            );
+            if !is_active {
+                panic!("Talos is not active or does not exist");
+            }
         }
 
         let config = Self::require_config(&env);
@@ -591,6 +679,42 @@ impl TalosGovernance {
         env.storage().persistent().set(&DataKey::Config, &config);
     }
 
+    /// Update the registered TalosRegistry contract address (admin only).
+    ///
+    /// Requires admin authorization. Setting this address enables Talos ID
+    /// validation during `create_proposal`.
+    pub fn set_registry_contract(env: Env, admin: Address, registry: Address) {
+        pause_control::check_not_paused(&env, PAUSE_GOVERNANCE_CONFIG);
+        Self::require_admin(&env, &admin);
+
+        let old_registry = env
+            .storage()
+            .persistent()
+            .get::<_, Address>(&DataKey::RegistryContract);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::RegistryContract, &registry);
+
+        emit_registry_updated(&env, old_registry, registry);
+    }
+
+    /// Alias for `set_registry_contract` (admin only).
+    pub fn set_registry(env: Env, admin: Address, registry: Address) {
+        Self::set_registry_contract(env, admin, registry);
+    }
+
+    /// Verify that the configured `RegistryContract` exposes the
+    /// `TalosRegistry` interface and supports version `(1, 1, 0)` or higher.
+    pub fn assert_registry_compatible(env: Env) -> bool {
+        let registry: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RegistryContract)
+            .expect("Registry contract not initialized");
+        check_registry_compatible(&env, &registry, true)
+    }
+
     // ── Dividend Snapshots (#598) ─────────────────────────────────────
 
     /// Record a new dividend snapshot epoch (admin only).
@@ -734,6 +858,16 @@ impl TalosGovernance {
 
     pub fn get_admin(env: Env) -> Option<Address> {
         env.storage().persistent().get(&DataKey::Admin)
+    }
+
+    /// Return the registered TalosRegistry contract address, if configured.
+    pub fn get_registry(env: Env) -> Option<Address> {
+        env.storage().persistent().get(&DataKey::RegistryContract)
+    }
+
+    /// Return the registered TalosRegistry contract address, if configured.
+    pub fn get_registry_contract(env: Env) -> Option<Address> {
+        env.storage().persistent().get(&DataKey::RegistryContract)
     }
 
     // ── Quorum State (#599) ──────────────────────────────────────────
@@ -3046,5 +3180,316 @@ mod tests {
             "rejected create_proposal memory {} exceeded ceiling {}",
             mem, BUDGET_MEM_CREATE_PROPOSAL,
         );
+    }
+
+    // ── Talos Registry Integration Tests ─────────────────────────────
+
+    mod talos_reg {
+        use super::*;
+
+        #[contract]
+        pub struct TalosRegistry;
+
+        #[contractimpl]
+        impl TalosRegistry {
+            pub fn is_active(env: Env, talos_id: u32) -> bool {
+                env.storage().persistent().get(&talos_id).unwrap_or(false)
+            }
+
+            pub fn set_active(env: Env, talos_id: u32, active: bool) {
+                env.storage().persistent().set(&talos_id, &active);
+            }
+
+            pub fn interface_id(env: Env) -> BytesN<32> {
+                BytesN::from_array(&env, &EXPECTED_REGISTRY_INTERFACE_ID)
+            }
+
+            pub fn version(_env: Env) -> (u32, u32, u32) {
+                (1, 4, 0)
+            }
+        }
+    }
+
+    mod mock_reg {
+        use super::*;
+
+        #[contract]
+        pub struct MockRegistry;
+
+        #[contractimpl]
+        impl MockRegistry {
+            pub fn is_active(_env: Env, talos_id: u32) -> bool {
+                talos_id == 42
+            }
+
+            pub fn interface_id(env: Env) -> BytesN<32> {
+                BytesN::from_array(&env, &EXPECTED_REGISTRY_INTERFACE_ID)
+            }
+
+            pub fn version(_env: Env) -> (u32, u32, u32) {
+                (1, 4, 0)
+            }
+        }
+    }
+
+    use mock_reg::MockRegistry;
+    use talos_reg::{TalosRegistry, TalosRegistryClient};
+
+    #[test]
+    fn test_set_registry_contract_admin_only() {
+        let (env, contract_id, admin, _pulse, client) = setup();
+        let registry_id = env.register_contract(None, TalosRegistry);
+        let non_admin = Address::generate(&env);
+
+        // Initially no registry is set.
+        assert_eq!(client.get_registry(), None);
+        assert_eq!(client.get_registry_contract(), None);
+
+        // Non-admin cannot set registry.
+        let bad_res = client
+            .mock_auths(&[MockAuth {
+                address: &non_admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "set_registry_contract",
+                    args: (non_admin.clone(), registry_id.clone()).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_set_registry_contract(&non_admin, &registry_id);
+        assert!(bad_res.is_err(), "Non-admin must not set registry");
+
+        // Admin can set registry.
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "set_registry_contract",
+                    args: (admin.clone(), registry_id.clone()).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .set_registry_contract(&admin, &registry_id);
+
+        assert_eq!(client.get_registry(), Some(registry_id.clone()));
+        assert_eq!(client.get_registry_contract(), Some(registry_id.clone()));
+    }
+
+    #[test]
+    fn test_create_proposal_with_registered_registry_active_id_succeeds() {
+        let (env, contract_id, admin, _pulse, client) = setup();
+        let registry_id = env.register_contract(None, TalosRegistry);
+        let registry_client = TalosRegistryClient::new(&env, &registry_id);
+
+        // Register active Talos ID 1.
+        registry_client.set_active(&1_u32, &true);
+
+        // Admin configures the registry.
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "set_registry_contract",
+                    args: (admin.clone(), registry_id.clone()).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .set_registry_contract(&admin, &registry_id);
+
+        let proposer = Address::generate(&env);
+        let title = s(&env, "Treasury proposal");
+        let description = s(&env, "Allocate funds.");
+
+        let proposal_id = client
+            .mock_auths(&[MockAuth {
+                address: &proposer,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "create_proposal",
+                    args: (proposer.clone(), 1_u32, title.clone(), description.clone()).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .create_proposal(&proposer, &1_u32, &title, &description);
+
+        assert_eq!(proposal_id, 1);
+        let proposal = client.get_proposal(&proposal_id).unwrap();
+        assert_eq!(proposal.talos_id, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "Talos is not active or does not exist")]
+    fn test_create_proposal_with_registered_registry_inactive_id_fails() {
+        let (env, contract_id, admin, _pulse, client) = setup();
+        let registry_id = env.register_contract(None, TalosRegistry);
+        let registry_client = TalosRegistryClient::new(&env, &registry_id);
+
+        // Set Talos ID 2 explicitly to inactive (false).
+        registry_client.set_active(&2_u32, &false);
+
+        // Admin configures the registry.
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "set_registry_contract",
+                    args: (admin.clone(), registry_id.clone()).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .set_registry_contract(&admin, &registry_id);
+
+        let proposer = Address::generate(&env);
+        let title = s(&env, "Treasury proposal");
+        let description = s(&env, "Allocate funds.");
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &proposer,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "create_proposal",
+                    args: (proposer.clone(), 2_u32, title.clone(), description.clone()).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .create_proposal(&proposer, &2_u32, &title, &description);
+    }
+
+    #[test]
+    #[should_panic(expected = "Talos is not active or does not exist")]
+    fn test_create_proposal_with_registered_registry_unknown_id_fails() {
+        let (env, contract_id, admin, _pulse, client) = setup();
+        let registry_id = env.register_contract(None, TalosRegistry);
+
+        // Admin configures the registry.
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "set_registry_contract",
+                    args: (admin.clone(), registry_id.clone()).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .set_registry_contract(&admin, &registry_id);
+
+        let proposer = Address::generate(&env);
+        let title = s(&env, "Unknown ID proposal");
+        let description = s(&env, "Allocate funds.");
+
+        // Talos ID 999 was never registered, is_active returns false.
+        client
+            .mock_auths(&[MockAuth {
+                address: &proposer,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "create_proposal",
+                    args: (proposer.clone(), 999_u32, title.clone(), description.clone()).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .create_proposal(&proposer, &999_u32, &title, &description);
+    }
+
+    #[test]
+    fn test_create_proposal_with_mock_inactive_ids() {
+        let (env, contract_id, admin, _pulse, client) = setup();
+        let mock_id = env.register_contract(None, MockRegistry);
+
+        // Admin configures the mock registry.
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "set_registry",
+                    args: (admin.clone(), mock_id.clone()).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .set_registry(&admin, &mock_id);
+
+        let proposer = Address::generate(&env);
+        let title = s(&env, "Mock test proposal");
+        let description = s(&env, "Mock description.");
+
+        // Active mock id (42) succeeds.
+        let pid = client
+            .mock_auths(&[MockAuth {
+                address: &proposer,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "create_proposal",
+                    args: (proposer.clone(), 42_u32, title.clone(), description.clone()).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .create_proposal(&proposer, &42_u32, &title, &description);
+        assert_eq!(pid, 1);
+
+        // Inactive mock id (100) fails.
+        let res = client
+            .mock_auths(&[MockAuth {
+                address: &proposer,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "create_proposal",
+                    args: (proposer.clone(), 100_u32, title.clone(), description.clone()).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_create_proposal(&proposer, &100_u32, &title, &description);
+        assert!(res.is_err(), "Inactive mock ID must fail");
+    }
+
+    #[test]
+    fn test_create_proposal_registry_unset_skips_check() {
+        let (env, contract_id, _admin, _pulse, client) = setup();
+
+        // Registry is unset by default.
+        assert_eq!(client.get_registry(), None);
+
+        let proposer = Address::generate(&env);
+        let title = s(&env, "Unset registry proposal");
+        let description = s(&env, "Should succeed because registry check is skipped.");
+
+        // Any ID succeeds when registry is unset (documented skip).
+        let pid = client
+            .mock_auths(&[MockAuth {
+                address: &proposer,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "create_proposal",
+                    args: (proposer.clone(), 999_u32, title.clone(), description.clone()).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .create_proposal(&proposer, &999_u32, &title, &description);
+        assert_eq!(pid, 1);
+    }
+
+    #[test]
+    fn test_assert_registry_compatible_succeeds_with_talos_registry() {
+        let (env, contract_id, admin, _pulse, client) = setup();
+        let registry_id = env.register_contract(None, TalosRegistry);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "set_registry_contract",
+                    args: (admin.clone(), registry_id.clone()).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .set_registry_contract(&admin, &registry_id);
+
+        assert!(client.assert_registry_compatible());
     }
 }
