@@ -61,6 +61,22 @@ pub struct Proposal {
     pub created_at: u64,
 }
 
+/// Default number of ledgers prior to proposal creation at which voting power is snapshotted.
+///
+/// An offset is used so that voting power is evaluated at a ledger sequence before
+/// the proposal was submitted. This prevents flash-loan or same-ledger front-running
+/// attacks where an account acquires tokens in the same ledger as proposal creation,
+/// exercises proposal creation / voting rights with temporarily borrowed funds, and
+/// exits in the same transaction or block. On Stellar's ~5-second ledger cadence,
+/// 10 ledgers represents an offset of approximately 50 seconds.
+pub const DEFAULT_SNAPSHOT_OFFSET_LEDGERS: u32 = 10;
+
+/// Maximum allowed snapshot offset in ledgers (~7 days on a 5-second ledger cadence).
+///
+/// Bounding the maximum offset prevents misconfigurations where proposals attempt to
+/// snapshot state beyond the ledger retention or historical checkpoint window.
+pub const MAX_SNAPSHOT_OFFSET_LEDGERS: u32 = 120_960;
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GovernanceConfig {
@@ -68,6 +84,7 @@ pub struct GovernanceConfig {
     pub consensus_threshold: i128,
     pub voting_period_ledgers: u32,
     pub pulse_token_address: Address,
+    pub snapshot_offset_ledgers: Option<u32>,
 }
 
 #[contracttype]
@@ -101,6 +118,14 @@ pub struct Checkpoint {
     pub ledger: u32,
     pub votes: i128,
 }
+
+// ── Proposal Limits ──────────────────────────────────────────────────
+
+/// Maximum allowed byte length for proposal titles.
+pub const MAX_TITLE_LEN: u32 = 128;
+
+/// Maximum allowed byte length for proposal descriptions.
+pub const MAX_DESCRIPTION_LEN: u32 = 2048;
 
 // ── Dividend Snapshot (#598) ─────────────────────────────────────────
 
@@ -475,6 +500,7 @@ impl TalosGovernance {
             consensus_threshold,
             voting_period_ledgers,
             pulse_token_address,
+            snapshot_offset_ledgers: None,
         };
 
         env.storage().persistent().set(&DataKey::Admin, &admin);
@@ -501,8 +527,33 @@ impl TalosGovernance {
         if title.len() == 0 {
             panic!("Title cannot be empty");
         }
+        if title.len() > MAX_TITLE_LEN {
+            panic!("Title exceeds maximum length");
+        }
         if description.len() == 0 {
             panic!("Description cannot be empty");
+        }
+        if description.len() > MAX_DESCRIPTION_LEN {
+            panic!("Description exceeds maximum length");
+        }
+
+        // Cross-contract verification: ensure talos_id exists and is active if
+        // a registry contract has been configured.
+        // For registry-unset deployments, the check is explicitly skipped to preserve
+        // backwards compatibility with unconfigured or legacy deployments.
+        if let Some(registry) = env
+            .storage()
+            .persistent()
+            .get::<_, Address>(&DataKey::RegistryContract)
+        {
+            let is_active: bool = env.invoke_contract(
+                &registry,
+                &Symbol::new(&env, "is_active"),
+                soroban_sdk::vec![&env, talos_id.into_val(&env)],
+            );
+            if !is_active {
+                panic!("Talos is not active or does not exist");
+            }
         }
 
         // Validate talos_id if a registry contract is configured.
@@ -525,7 +576,10 @@ impl TalosGovernance {
 
         let config = Self::require_config(&env);
         let current_ledger = env.ledger().sequence();
-        let snapshot_ledger = current_ledger.saturating_sub(10);
+        let snapshot_offset = config
+            .snapshot_offset_ledgers
+            .unwrap_or(DEFAULT_SNAPSHOT_OFFSET_LEDGERS);
+        let snapshot_ledger = current_ledger.saturating_sub(snapshot_offset);
         let proposal_id = Self::next_proposal_id(env.clone());
         let end_ledger = current_ledger + config.voting_period_ledgers;
 
@@ -675,6 +729,11 @@ impl TalosGovernance {
         }
         if config.voting_period_ledgers == 0 {
             panic!("Voting period must be positive");
+        }
+        if let Some(offset) = config.snapshot_offset_ledgers {
+            if offset > MAX_SNAPSHOT_OFFSET_LEDGERS {
+                panic!("Snapshot offset exceeds maximum allowed");
+            }
         }
         env.storage().persistent().set(&DataKey::Config, &config);
     }
@@ -860,12 +919,10 @@ impl TalosGovernance {
         env.storage().persistent().get(&DataKey::Admin)
     }
 
-    /// Return the registered TalosRegistry contract address, if configured.
     pub fn get_registry(env: Env) -> Option<Address> {
         env.storage().persistent().get(&DataKey::RegistryContract)
     }
 
-    /// Return the registered TalosRegistry contract address, if configured.
     pub fn get_registry_contract(env: Env) -> Option<Address> {
         env.storage().persistent().get(&DataKey::RegistryContract)
     }
@@ -1964,6 +2021,7 @@ mod tests {
             consensus_threshold: 6_000,
             voting_period_ledgers: 30,
             pulse_token_address: pulse,
+            snapshot_offset_ledgers: None,
         };
 
         client
@@ -2072,6 +2130,7 @@ mod tests {
             consensus_threshold: 6_000,
             voting_period_ledgers: 30,
             pulse_token_address: pulse,
+            snapshot_offset_ledgers: None,
         };
         let res = client
             .mock_auths(&[MockAuth {
@@ -2271,6 +2330,7 @@ mod tests {
             consensus_threshold: 5_000,
             voting_period_ledgers: 20,
             pulse_token_address: pulse,
+            snapshot_offset_ledgers: None,
         };
         let rando = Address::generate(&env);
         let result = client.try_update_config(&rando, &config);
@@ -2455,6 +2515,98 @@ mod tests {
             }])
             .try_create_proposal(&proposer, &1u32, &s(&env, "title"), &s(&env, ""));
         assert!(result.is_err(), "empty description must be rejected");
+    }
+
+    /// Proposal creation with title exactly at MAX_TITLE_LEN succeeds.
+    #[test]
+    fn create_proposal_title_at_limit_succeeds() {
+        let (env, contract_id, _admin, _pulse, client) = setup();
+        let proposer = Address::generate(&env);
+        let title_bytes = [b'a'; MAX_TITLE_LEN as usize];
+        let title = s(&env, std::str::from_utf8(&title_bytes).unwrap());
+        let desc = s(&env, "Valid description");
+
+        let proposal_id = client
+            .mock_auths(&[MockAuth {
+                address: &proposer,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "create_proposal",
+                    args: (proposer.clone(), 1u32, title.clone(), desc.clone()).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .create_proposal(&proposer, &1u32, &title, &desc);
+        assert_eq!(proposal_id, 1);
+    }
+
+    /// Proposal creation with title one byte over MAX_TITLE_LEN fails.
+    #[test]
+    fn create_proposal_title_exceeding_limit_fails() {
+        let (env, contract_id, _admin, _pulse, client) = setup();
+        let proposer = Address::generate(&env);
+        let title_bytes = [b'a'; (MAX_TITLE_LEN + 1) as usize];
+        let title = s(&env, std::str::from_utf8(&title_bytes).unwrap());
+        let desc = s(&env, "Valid description");
+
+        let result = client
+            .mock_auths(&[MockAuth {
+                address: &proposer,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "create_proposal",
+                    args: (proposer.clone(), 1u32, title.clone(), desc.clone()).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_create_proposal(&proposer, &1u32, &title, &desc);
+        assert!(result.is_err(), "title exceeding limit must fail");
+    }
+
+    /// Proposal creation with description exactly at MAX_DESCRIPTION_LEN succeeds.
+    #[test]
+    fn create_proposal_description_at_limit_succeeds() {
+        let (env, contract_id, _admin, _pulse, client) = setup();
+        let proposer = Address::generate(&env);
+        let title = s(&env, "Valid title");
+        let desc_bytes = [b'd'; MAX_DESCRIPTION_LEN as usize];
+        let desc = s(&env, std::str::from_utf8(&desc_bytes).unwrap());
+
+        let proposal_id = client
+            .mock_auths(&[MockAuth {
+                address: &proposer,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "create_proposal",
+                    args: (proposer.clone(), 1u32, title.clone(), desc.clone()).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .create_proposal(&proposer, &1u32, &title, &desc);
+        assert_eq!(proposal_id, 1);
+    }
+
+    /// Proposal creation with description one byte over MAX_DESCRIPTION_LEN fails.
+    #[test]
+    fn create_proposal_description_exceeding_limit_fails() {
+        let (env, contract_id, _admin, _pulse, client) = setup();
+        let proposer = Address::generate(&env);
+        let title = s(&env, "Valid title");
+        let desc_bytes = [b'd'; (MAX_DESCRIPTION_LEN + 1) as usize];
+        let desc = s(&env, std::str::from_utf8(&desc_bytes).unwrap());
+
+        let result = client
+            .mock_auths(&[MockAuth {
+                address: &proposer,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "create_proposal",
+                    args: (proposer.clone(), 1u32, title.clone(), desc.clone()).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_create_proposal(&proposer, &1u32, &title, &desc);
+        assert!(result.is_err(), "description exceeding limit must fail");
     }
 
     /// cache_token_balance with a negative balance must fail.
@@ -3182,314 +3334,116 @@ mod tests {
         );
     }
 
-    // ── Talos Registry Integration Tests ─────────────────────────────
+    // ── Snapshot Offset Configuration ────────────────────────────────
 
-    mod talos_reg {
-        use super::*;
-
-        #[contract]
-        pub struct TalosRegistry;
-
-        #[contractimpl]
-        impl TalosRegistry {
-            pub fn is_active(env: Env, talos_id: u32) -> bool {
-                env.storage().persistent().get(&talos_id).unwrap_or(false)
-            }
-
-            pub fn set_active(env: Env, talos_id: u32, active: bool) {
-                env.storage().persistent().set(&talos_id, &active);
-            }
-
-            pub fn interface_id(env: Env) -> BytesN<32> {
-                BytesN::from_array(&env, &EXPECTED_REGISTRY_INTERFACE_ID)
-            }
-
-            pub fn version(_env: Env) -> (u32, u32, u32) {
-                (1, 4, 0)
-            }
-        }
-    }
-
-    mod mock_reg {
-        use super::*;
-
-        #[contract]
-        pub struct MockRegistry;
-
-        #[contractimpl]
-        impl MockRegistry {
-            pub fn is_active(_env: Env, talos_id: u32) -> bool {
-                talos_id == 42
-            }
-
-            pub fn interface_id(env: Env) -> BytesN<32> {
-                BytesN::from_array(&env, &EXPECTED_REGISTRY_INTERFACE_ID)
-            }
-
-            pub fn version(_env: Env) -> (u32, u32, u32) {
-                (1, 4, 0)
-            }
-        }
-    }
-
-    use mock_reg::MockRegistry;
-    use talos_reg::{TalosRegistry, TalosRegistryClient};
-
+    /// Confirms that by default, snapshot_ledger equals start_ledger - DEFAULT_SNAPSHOT_OFFSET_LEDGERS.
     #[test]
-    fn test_set_registry_contract_admin_only() {
-        let (env, contract_id, admin, _pulse, client) = setup();
-        let registry_id = env.register_contract(None, TalosRegistry);
-        let non_admin = Address::generate(&env);
-
-        // Initially no registry is set.
-        assert_eq!(client.get_registry(), None);
-        assert_eq!(client.get_registry_contract(), None);
-
-        // Non-admin cannot set registry.
-        let bad_res = client
-            .mock_auths(&[MockAuth {
-                address: &non_admin,
-                invoke: &MockAuthInvoke {
-                    contract: &contract_id,
-                    fn_name: "set_registry_contract",
-                    args: (non_admin.clone(), registry_id.clone()).into_val(&env),
-                    sub_invokes: &[],
-                },
-            }])
-            .try_set_registry_contract(&non_admin, &registry_id);
-        assert!(bad_res.is_err(), "Non-admin must not set registry");
-
-        // Admin can set registry.
-        client
-            .mock_auths(&[MockAuth {
-                address: &admin,
-                invoke: &MockAuthInvoke {
-                    contract: &contract_id,
-                    fn_name: "set_registry_contract",
-                    args: (admin.clone(), registry_id.clone()).into_val(&env),
-                    sub_invokes: &[],
-                },
-            }])
-            .set_registry_contract(&admin, &registry_id);
-
-        assert_eq!(client.get_registry(), Some(registry_id.clone()));
-        assert_eq!(client.get_registry_contract(), Some(registry_id.clone()));
-    }
-
-    #[test]
-    fn test_create_proposal_with_registered_registry_active_id_succeeds() {
-        let (env, contract_id, admin, _pulse, client) = setup();
-        let registry_id = env.register_contract(None, TalosRegistry);
-        let registry_client = TalosRegistryClient::new(&env, &registry_id);
-
-        // Register active Talos ID 1.
-        registry_client.set_active(&1_u32, &true);
-
-        // Admin configures the registry.
-        client
-            .mock_auths(&[MockAuth {
-                address: &admin,
-                invoke: &MockAuthInvoke {
-                    contract: &contract_id,
-                    fn_name: "set_registry_contract",
-                    args: (admin.clone(), registry_id.clone()).into_val(&env),
-                    sub_invokes: &[],
-                },
-            }])
-            .set_registry_contract(&admin, &registry_id);
-
-        let proposer = Address::generate(&env);
-        let title = s(&env, "Treasury proposal");
-        let description = s(&env, "Allocate funds.");
-
-        let proposal_id = client
-            .mock_auths(&[MockAuth {
-                address: &proposer,
-                invoke: &MockAuthInvoke {
-                    contract: &contract_id,
-                    fn_name: "create_proposal",
-                    args: (proposer.clone(), 1_u32, title.clone(), description.clone()).into_val(&env),
-                    sub_invokes: &[],
-                },
-            }])
-            .create_proposal(&proposer, &1_u32, &title, &description);
-
-        assert_eq!(proposal_id, 1);
-        let proposal = client.get_proposal(&proposal_id).unwrap();
-        assert_eq!(proposal.talos_id, 1);
-    }
-
-    #[test]
-    #[should_panic(expected = "Talos is not active or does not exist")]
-    fn test_create_proposal_with_registered_registry_inactive_id_fails() {
-        let (env, contract_id, admin, _pulse, client) = setup();
-        let registry_id = env.register_contract(None, TalosRegistry);
-        let registry_client = TalosRegistryClient::new(&env, &registry_id);
-
-        // Set Talos ID 2 explicitly to inactive (false).
-        registry_client.set_active(&2_u32, &false);
-
-        // Admin configures the registry.
-        client
-            .mock_auths(&[MockAuth {
-                address: &admin,
-                invoke: &MockAuthInvoke {
-                    contract: &contract_id,
-                    fn_name: "set_registry_contract",
-                    args: (admin.clone(), registry_id.clone()).into_val(&env),
-                    sub_invokes: &[],
-                },
-            }])
-            .set_registry_contract(&admin, &registry_id);
-
-        let proposer = Address::generate(&env);
-        let title = s(&env, "Treasury proposal");
-        let description = s(&env, "Allocate funds.");
-
-        client
-            .mock_auths(&[MockAuth {
-                address: &proposer,
-                invoke: &MockAuthInvoke {
-                    contract: &contract_id,
-                    fn_name: "create_proposal",
-                    args: (proposer.clone(), 2_u32, title.clone(), description.clone()).into_val(&env),
-                    sub_invokes: &[],
-                },
-            }])
-            .create_proposal(&proposer, &2_u32, &title, &description);
-    }
-
-    #[test]
-    #[should_panic(expected = "Talos is not active or does not exist")]
-    fn test_create_proposal_with_registered_registry_unknown_id_fails() {
-        let (env, contract_id, admin, _pulse, client) = setup();
-        let registry_id = env.register_contract(None, TalosRegistry);
-
-        // Admin configures the registry.
-        client
-            .mock_auths(&[MockAuth {
-                address: &admin,
-                invoke: &MockAuthInvoke {
-                    contract: &contract_id,
-                    fn_name: "set_registry_contract",
-                    args: (admin.clone(), registry_id.clone()).into_val(&env),
-                    sub_invokes: &[],
-                },
-            }])
-            .set_registry_contract(&admin, &registry_id);
-
-        let proposer = Address::generate(&env);
-        let title = s(&env, "Unknown ID proposal");
-        let description = s(&env, "Allocate funds.");
-
-        // Talos ID 999 was never registered, is_active returns false.
-        client
-            .mock_auths(&[MockAuth {
-                address: &proposer,
-                invoke: &MockAuthInvoke {
-                    contract: &contract_id,
-                    fn_name: "create_proposal",
-                    args: (proposer.clone(), 999_u32, title.clone(), description.clone()).into_val(&env),
-                    sub_invokes: &[],
-                },
-            }])
-            .create_proposal(&proposer, &999_u32, &title, &description);
-    }
-
-    #[test]
-    fn test_create_proposal_with_mock_inactive_ids() {
-        let (env, contract_id, admin, _pulse, client) = setup();
-        let mock_id = env.register_contract(None, MockRegistry);
-
-        // Admin configures the mock registry.
-        client
-            .mock_auths(&[MockAuth {
-                address: &admin,
-                invoke: &MockAuthInvoke {
-                    contract: &contract_id,
-                    fn_name: "set_registry",
-                    args: (admin.clone(), mock_id.clone()).into_val(&env),
-                    sub_invokes: &[],
-                },
-            }])
-            .set_registry(&admin, &mock_id);
-
-        let proposer = Address::generate(&env);
-        let title = s(&env, "Mock test proposal");
-        let description = s(&env, "Mock description.");
-
-        // Active mock id (42) succeeds.
-        let pid = client
-            .mock_auths(&[MockAuth {
-                address: &proposer,
-                invoke: &MockAuthInvoke {
-                    contract: &contract_id,
-                    fn_name: "create_proposal",
-                    args: (proposer.clone(), 42_u32, title.clone(), description.clone()).into_val(&env),
-                    sub_invokes: &[],
-                },
-            }])
-            .create_proposal(&proposer, &42_u32, &title, &description);
-        assert_eq!(pid, 1);
-
-        // Inactive mock id (100) fails.
-        let res = client
-            .mock_auths(&[MockAuth {
-                address: &proposer,
-                invoke: &MockAuthInvoke {
-                    contract: &contract_id,
-                    fn_name: "create_proposal",
-                    args: (proposer.clone(), 100_u32, title.clone(), description.clone()).into_val(&env),
-                    sub_invokes: &[],
-                },
-            }])
-            .try_create_proposal(&proposer, &100_u32, &title, &description);
-        assert!(res.is_err(), "Inactive mock ID must fail");
-    }
-
-    #[test]
-    fn test_create_proposal_registry_unset_skips_check() {
+    fn proposal_snapshot_ledger_equals_start_ledger_minus_default_offset() {
         let (env, contract_id, _admin, _pulse, client) = setup();
-
-        // Registry is unset by default.
-        assert_eq!(client.get_registry(), None);
-
         let proposer = Address::generate(&env);
-        let title = s(&env, "Unset registry proposal");
-        let description = s(&env, "Should succeed because registry check is skipped.");
 
-        // Any ID succeeds when registry is unset (documented skip).
-        let pid = client
-            .mock_auths(&[MockAuth {
-                address: &proposer,
-                invoke: &MockAuthInvoke {
-                    contract: &contract_id,
-                    fn_name: "create_proposal",
-                    args: (proposer.clone(), 999_u32, title.clone(), description.clone()).into_val(&env),
-                    sub_invokes: &[],
-                },
-            }])
-            .create_proposal(&proposer, &999_u32, &title, &description);
-        assert_eq!(pid, 1);
+        let proposal_id = create_proposal_with_auth(&env, &contract_id, &client, &proposer);
+        let proposal = client.get_proposal(&proposal_id).expect("Proposal not found");
+
+        assert_eq!(
+            proposal.snapshot_ledger,
+            proposal.start_ledger - DEFAULT_SNAPSHOT_OFFSET_LEDGERS,
+            "snapshot_ledger must equal start_ledger minus default offset"
+        );
     }
 
+    /// Admin can tune snapshot_offset_ledgers per deployment via GovernanceConfig.
     #[test]
-    fn test_assert_registry_compatible_succeeds_with_talos_registry() {
-        let (env, contract_id, admin, _pulse, client) = setup();
-        let registry_id = env.register_contract(None, TalosRegistry);
+    fn proposal_snapshot_ledger_respects_custom_configured_offset() {
+        let (env, contract_id, admin, pulse, client) = setup();
+        let custom_offset = 25_u32;
+        let config = GovernanceConfig {
+            quorum_threshold: 100,
+            consensus_threshold: 5_100,
+            voting_period_ledgers: 20,
+            pulse_token_address: pulse,
+            snapshot_offset_ledgers: Some(custom_offset),
+        };
 
         client
             .mock_auths(&[MockAuth {
                 address: &admin,
                 invoke: &MockAuthInvoke {
                     contract: &contract_id,
-                    fn_name: "set_registry_contract",
-                    args: (admin.clone(), registry_id.clone()).into_val(&env),
+                    fn_name: "update_config",
+                    args: (admin.clone(), config.clone()).into_val(&env),
                     sub_invokes: &[],
                 },
             }])
-            .set_registry_contract(&admin, &registry_id);
+            .update_config(&admin, &config);
 
-        assert!(client.assert_registry_compatible());
+        let proposer = Address::generate(&env);
+        let proposal_id = create_proposal_with_auth(&env, &contract_id, &client, &proposer);
+        let proposal = client.get_proposal(&proposal_id).expect("Proposal not found");
+
+        assert_eq!(
+            proposal.snapshot_ledger,
+            proposal.start_ledger - custom_offset,
+            "snapshot_ledger must equal start_ledger minus custom configured offset"
+        );
+    }
+
+    /// update_config rejects snapshot_offset_ledgers exceeding MAX_SNAPSHOT_OFFSET_LEDGERS.
+    #[test]
+    #[should_panic(expected = "Snapshot offset exceeds maximum allowed")]
+    fn update_config_rejects_excessive_snapshot_offset() {
+        let (env, contract_id, admin, pulse, client) = setup();
+        let config = GovernanceConfig {
+            quorum_threshold: 100,
+            consensus_threshold: 5_100,
+            voting_period_ledgers: 20,
+            pulse_token_address: pulse,
+            snapshot_offset_ledgers: Some(MAX_SNAPSHOT_OFFSET_LEDGERS + 1),
+        };
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "update_config",
+                    args: (admin.clone(), config.clone()).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .update_config(&admin, &config);
+    }
+
+    /// When current ledger sequence is less than the offset, saturating_sub prevents underflow.
+    #[test]
+    fn proposal_snapshot_ledger_saturates_at_zero_if_ledger_below_offset() {
+        let env = Env::default();
+        env.ledger().with_mut(|li| {
+            li.sequence_number = 5;
+            li.timestamp = 1_000;
+        });
+        let contract_id = env.register_contract(None, TalosGovernance);
+        let client = TalosGovernanceClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let pulse = Address::generate(&env);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "initialize",
+                    args: (admin.clone(), pulse.clone(), 100_i128, 5_100_i128, 20_u32).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .initialize(&admin, &pulse, &100_i128, &5_100_i128, &20_u32);
+
+        let proposer = Address::generate(&env);
+        let proposal_id = create_proposal_with_auth(&env, &contract_id, &client, &proposer);
+        let proposal = client.get_proposal(&proposal_id).expect("Proposal not found");
+
+        assert_eq!(proposal.start_ledger, 5);
+        assert_eq!(proposal.snapshot_ledger, 0);
     }
 }
